@@ -85,13 +85,17 @@ const UPLOAD_MAX_BYTES = 16_000_000;
 const UPLOAD_MIN_SAMPLE_BYTES = 300_000;
 const UPLOAD_MAX_SAMPLE_BYTES = 5_000_000;
 
+const DISCOVERY_REQUEST_TIMEOUT_MS = 8_000;
+const LATENCY_REQUEST_TIMEOUT_MS = 6_000;
+const TRANSFER_REQUEST_TIMEOUT_MS = 24_000;
+
 export class SpeedTestService {
   private listeners = new Set<Listener>();
   private abortController: AbortController | null = null;
   private latestResults: SpeedTestResults | null = null;
   private measurementId = createMeasurementId();
   private providerMetadata: SpeedTestProviderMetadata | null = null;
-  private readonly provider = getSpeedTestProvider();
+  private provider = getSpeedTestProvider();
   private fastTargets: FastTarget[] = [];
   private stopped = false;
 
@@ -106,66 +110,34 @@ export class SpeedTestService {
     this.measurementId = createMeasurementId();
     this.providerMetadata = null;
     this.fastTargets = [];
+    this.provider = getSpeedTestProvider();
     this.stopped = false;
 
     try {
-      this.emitSnapshot("connecting", "Connecting...", 4, 0);
-      await this.wait(280);
-
-      let serverInfo = await this.findServer();
-
-      this.emitSnapshot("latency", "Analyzing latency...", 20, 0);
-      const latencySamples = await this.measureLatency(5);
-      const pingMs = average(latencySamples);
-      const jitterMs = calculateJitter(latencySamples);
-      serverInfo = this.getCurrentServerInfo(serverInfo);
-
-      this.emitSnapshot("download", "Testing download...", DOWNLOAD_START_PROGRESS, 0);
-      const downloadMbps = await this.measureDownload((value, progress) => {
-        this.emitSnapshot("download", "Testing download...", progress, value);
-      });
-
-      this.emitSnapshot("upload", "Testing upload...", UPLOAD_START_PROGRESS, downloadMbps);
-      const uploadMbps = await this.measureUpload(downloadMbps);
-      serverInfo = this.getCurrentServerInfo(serverInfo);
-
-      this.emitSnapshot("jitter", "Measuring jitter...", 84, downloadMbps);
-      await this.wait(320);
-
-      this.emitSnapshot("packetLoss", "Finalizing diagnostics...", 92, downloadMbps);
-      const packetLossPercent = null;
-      await this.wait(260);
-
-      const diagnostics = this.collectDiagnostics({
-        pingMs,
-        jitterMs,
-        packetLossPercent,
-      });
-
-      const results: SpeedTestResults = {
-        downloadMbps,
-        uploadMbps,
-        pingMs,
-        jitterMs,
-        packetLossPercent,
-        server: serverInfo,
-        diagnostics,
-        completedAt: new Date().toISOString(),
-      };
-
-      this.latestResults = results;
-      this.emitSnapshot("complete", "Completed", 100, downloadMbps);
-      this.emit({ type: "complete", payload: results });
+      const results = await this.runTest();
+      this.complete(results);
     } catch (error) {
       if (this.stopped) {
         return;
       }
 
-      this.emitSnapshot("error", "Unable to complete test", 0, 0);
-      this.emit({
-        type: "error",
-        payload: error instanceof Error ? error : new Error("Speed test failed"),
-      });
+      if (this.canUseCloudflareFallback()) {
+        try {
+          this.switchToCloudflareFallback();
+          const results = await this.runTest("Connecting to backup server...");
+          this.complete(results);
+          return;
+        } catch (fallbackError) {
+          if (this.stopped) {
+            return;
+          }
+
+          this.fail(fallbackError);
+          return;
+        }
+      }
+
+      this.fail(error);
     }
   }
 
@@ -177,6 +149,78 @@ export class SpeedTestService {
 
   getResults(): SpeedTestResults | null {
     return this.latestResults;
+  }
+
+  private async runTest(connectingLabel = "Connecting..."): Promise<SpeedTestResults> {
+    this.emitSnapshot("connecting", connectingLabel, 4, 0);
+    await this.wait(280);
+
+    let serverInfo = await this.findServer();
+
+    this.emitSnapshot("latency", "Analyzing latency...", 20, 0);
+    const latencySamples = await this.measureLatency(5);
+    const pingMs = average(latencySamples);
+    const jitterMs = calculateJitter(latencySamples);
+    serverInfo = this.getCurrentServerInfo(serverInfo);
+
+    this.emitSnapshot("download", "Testing download...", DOWNLOAD_START_PROGRESS, 0);
+    const downloadMbps = await this.measureDownload((value, progress) => {
+      this.emitSnapshot("download", "Testing download...", progress, value);
+    });
+
+    this.emitSnapshot("upload", "Testing upload...", UPLOAD_START_PROGRESS, downloadMbps);
+    const uploadMbps = await this.measureUpload(downloadMbps);
+    serverInfo = this.getCurrentServerInfo(serverInfo);
+
+    this.emitSnapshot("jitter", "Measuring jitter...", 84, downloadMbps);
+    await this.wait(320);
+
+    this.emitSnapshot("packetLoss", "Finalizing diagnostics...", 92, downloadMbps);
+    const packetLossPercent = null;
+    await this.wait(260);
+
+    const diagnostics = this.collectDiagnostics({
+      pingMs,
+      jitterMs,
+      packetLossPercent,
+    });
+
+    return {
+      downloadMbps,
+      uploadMbps,
+      pingMs,
+      jitterMs,
+      packetLossPercent,
+      server: serverInfo,
+      diagnostics,
+      completedAt: new Date().toISOString(),
+    };
+  }
+
+  private canUseCloudflareFallback(): boolean {
+    return this.provider.kind === "fast";
+  }
+
+  private switchToCloudflareFallback(): void {
+    this.emitSnapshot("server", "Switching to backup server...", 12, 0);
+    this.provider = getCloudflareProvider();
+    this.measurementId = createMeasurementId();
+    this.providerMetadata = null;
+    this.fastTargets = [];
+  }
+
+  private complete(results: SpeedTestResults): void {
+    this.latestResults = results;
+    this.emitSnapshot("complete", "Completed", 100, results.downloadMbps);
+    this.emit({ type: "complete", payload: results });
+  }
+
+  private fail(error: unknown): void {
+    this.emitSnapshot("error", "Unable to complete test", 0, 0);
+    this.emit({
+      type: "error",
+      payload: error instanceof Error ? error : new Error("Speed test failed"),
+    });
   }
 
   private async findServer(): Promise<ServerInfo> {
@@ -195,36 +239,42 @@ export class SpeedTestService {
     }
 
     const start = performance.now();
-    const response = await fetch(`/api/speed-test/ping?t=${Date.now()}`, {
-      cache: "no-store",
-      signal: this.abortController?.signal,
+    const body = await this.withRequestSignal(DISCOVERY_REQUEST_TIMEOUT_MS, async (signal) => {
+      const response = await fetch(`/api/speed-test/ping?t=${Date.now()}`, {
+        cache: "no-store",
+        signal,
+      });
+
+      if (!response.ok) {
+        throw new Error("Server discovery failed");
+      }
+
+      return (await response.json()) as PingResponse;
     });
-
-    if (!response.ok) {
-      throw new Error("Server discovery failed");
-    }
-
-    const body = (await response.json()) as PingResponse;
     const elapsed = performance.now() - start;
     await this.wait(Math.max(120, 260 - elapsed));
     return body.server;
   }
 
   private async fetchFastTargets(): Promise<FastTarget[]> {
-    if (!this.provider.targetDiscoveryUrl) {
+    const targetDiscoveryUrl = this.provider.targetDiscoveryUrl;
+
+    if (!targetDiscoveryUrl) {
       throw new Error("Fast.com target discovery is not configured");
     }
 
-    const response = await fetch(withQuery(this.provider.targetDiscoveryUrl, { t: Date.now() }), {
-      cache: "no-store",
-      signal: this.abortController?.signal,
+    const body = await this.withRequestSignal(DISCOVERY_REQUEST_TIMEOUT_MS, async (signal) => {
+      const response = await fetch(withQuery(targetDiscoveryUrl, { t: Date.now() }), {
+        cache: "no-store",
+        signal,
+      });
+
+      if (!response.ok) {
+        throw new Error("Fast.com target discovery failed");
+      }
+
+      return (await response.json()) as FastTargetsResponse;
     });
-
-    if (!response.ok) {
-      throw new Error("Fast.com target discovery failed");
-    }
-
-    const body = (await response.json()) as FastTargetsResponse;
     const targets = Array.isArray(body.targets)
       ? body.targets.filter((target) => typeof target.url === "string" && target.url.startsWith("https://"))
       : [];
@@ -246,15 +296,19 @@ export class SpeedTestService {
   }
 
   private async fetchProviderMetadata(): Promise<SpeedTestProviderMetadata | null> {
-    if (!this.provider.metadataUrl) {
+    const metadataUrl = this.provider.metadataUrl;
+
+    if (!metadataUrl) {
       return null;
     }
 
     try {
-      const response = await fetch(withQuery(this.provider.metadataUrl, { t: Date.now() }), {
-        cache: "no-store",
-        signal: this.abortController?.signal,
-      });
+      const response = await this.withRequestSignal(DISCOVERY_REQUEST_TIMEOUT_MS, (signal) =>
+        fetch(withQuery(metadataUrl, { t: Date.now() }), {
+          cache: "no-store",
+          signal,
+        }),
+      );
 
       if (!response.ok) {
         return null;
@@ -276,20 +330,24 @@ export class SpeedTestService {
     const values: number[] = [];
 
     for (let index = 0; index < samples; index += 1) {
-      const startedAt = performance.now();
-      const response = await fetch(this.createLatencyUrl(index), {
-        cache: "no-store",
-        headers: this.createDownloadHeaders(1),
-        signal: this.abortController?.signal,
+      const elapsedMs = await this.withRequestSignal(LATENCY_REQUEST_TIMEOUT_MS, async (signal) => {
+        const startedAt = performance.now();
+        const response = await fetch(this.createLatencyUrl(index), {
+          cache: "no-store",
+          headers: this.createDownloadHeaders(1),
+          signal,
+        });
+
+        if (!response.ok) {
+          throw new Error("Latency test failed");
+        }
+
+        this.captureProviderMetadata(response.headers);
+        await readResponseBytes(response);
+        return performance.now() - startedAt;
       });
 
-      if (!response.ok) {
-        throw new Error("Latency test failed");
-      }
-
-      this.captureProviderMetadata(response.headers);
-      await readResponseBytes(response);
-      values.push(performance.now() - startedAt);
+      values.push(elapsedMs);
       this.emitSnapshot("latency", "Analyzing latency...", 20 + index * 3, 0);
       await this.wait(80);
     }
@@ -359,56 +417,60 @@ export class SpeedTestService {
   }
 
   private async measureDownloadSample(bytes: number, index: number): Promise<TransferSample> {
-    const startedAt = performance.now();
-    const response = await fetch(this.createDownloadUrl(bytes, index), {
-      cache: "no-store",
-      headers: this.createDownloadHeaders(bytes),
-      signal: this.abortController?.signal,
+    return this.withRequestSignal(TRANSFER_REQUEST_TIMEOUT_MS, async (signal) => {
+      const startedAt = performance.now();
+      const response = await fetch(this.createDownloadUrl(bytes, index), {
+        cache: "no-store",
+        headers: this.createDownloadHeaders(bytes),
+        signal,
+      });
+
+      if (!response.ok) {
+        throw new Error("Download test failed");
+      }
+
+      this.captureProviderMetadata(response.headers);
+      const receivedBytes = await readResponseBytes(response);
+      const seconds = Math.max((performance.now() - startedAt) / 1000, 0.001);
+
+      return {
+        bytes: receivedBytes,
+        seconds,
+      };
     });
-
-    if (!response.ok) {
-      throw new Error("Download test failed");
-    }
-
-    this.captureProviderMetadata(response.headers);
-    const receivedBytes = await readResponseBytes(response);
-    const seconds = Math.max((performance.now() - startedAt) / 1000, 0.001);
-
-    return {
-      bytes: receivedBytes,
-      seconds,
-    };
   }
 
   private async measureUploadSample(bytes: number): Promise<TransferSample> {
-    const body = createUploadPayload(bytes);
-    const startedAt = performance.now();
-    const response = await fetch(this.createUploadUrl(bytes), {
-      method: "POST",
-      body,
-      cache: "no-store",
-      signal: this.abortController?.signal,
+    return this.withRequestSignal(TRANSFER_REQUEST_TIMEOUT_MS, async (signal) => {
+      const body = createUploadPayload(bytes);
+      const startedAt = performance.now();
+      const response = await fetch(this.createUploadUrl(bytes), {
+        method: "POST",
+        body,
+        cache: "no-store",
+        signal,
+      });
+
+      if (!response.ok) {
+        throw new Error("Upload test failed");
+      }
+
+      this.captureProviderMetadata(response.headers);
+      const confirmedBytes = this.provider.kind === "local"
+        ? Math.min(((await response.json()) as UploadResponse).receivedBytes, bytes)
+        : bytes;
+
+      if (this.provider.kind !== "local") {
+        await readResponseBytes(response);
+      }
+
+      const seconds = Math.max((performance.now() - startedAt) / 1000, 0.001);
+
+      return {
+        bytes: confirmedBytes,
+        seconds,
+      };
     });
-
-    if (!response.ok) {
-      throw new Error("Upload test failed");
-    }
-
-    this.captureProviderMetadata(response.headers);
-    const confirmedBytes = this.provider.kind === "local"
-      ? Math.min(((await response.json()) as UploadResponse).receivedBytes, bytes)
-      : bytes;
-
-    if (this.provider.kind !== "local") {
-      await readResponseBytes(response);
-    }
-
-    const seconds = Math.max((performance.now() - startedAt) / 1000, 0.001);
-
-    return {
-      bytes: confirmedBytes,
-      seconds,
-    };
   }
 
   private collectDiagnostics(metrics: {
@@ -578,6 +640,31 @@ export class SpeedTestService {
       );
     });
   }
+
+  private async withRequestSignal<T>(
+    timeoutMs: number,
+    request: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const requestController = new AbortController();
+    const timeout = window.setTimeout(() => {
+      requestController.abort(new DOMException("Speed test request timed out", "TimeoutError"));
+    }, timeoutMs);
+    const parentSignal = this.abortController?.signal;
+    const abortFromParent = () => requestController.abort(parentSignal?.reason);
+
+    if (parentSignal?.aborted) {
+      requestController.abort(parentSignal.reason);
+    } else {
+      parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+    }
+
+    try {
+      return await request(requestController.signal);
+    } finally {
+      window.clearTimeout(timeout);
+      parentSignal?.removeEventListener("abort", abortFromParent);
+    }
+  }
 }
 
 function normalizeConnectionType(type?: string): "wifi" | "cellular" | "ethernet" | "unknown" {
@@ -603,14 +690,7 @@ function getSpeedTestProvider(): SpeedTestProvider {
   }
 
   if (providerMode === "cloudflare") {
-    return {
-      kind: "cloudflare",
-      name: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_PROVIDER_NAME) ?? "Cloudflare Speed Test",
-      downloadUrl: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_DOWNLOAD_URL) ?? DEFAULT_REMOTE_DOWNLOAD_URL,
-      uploadUrl: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_UPLOAD_URL) ?? DEFAULT_REMOTE_UPLOAD_URL,
-      metadataUrl: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_METADATA_URL) ?? DEFAULT_REMOTE_METADATA_URL,
-      targetDiscoveryUrl: null,
-    };
+    return getCloudflareProvider({ useConfiguredName: true });
   }
 
   return {
@@ -620,6 +700,19 @@ function getSpeedTestProvider(): SpeedTestProvider {
     uploadUrl: "",
     metadataUrl: null,
     targetDiscoveryUrl: cleanEnv(process.env.NEXT_PUBLIC_FAST_TARGETS_URL) ?? FAST_TARGETS_URL,
+  };
+}
+
+function getCloudflareProvider(options: { useConfiguredName?: boolean } = {}): SpeedTestProvider {
+  return {
+    kind: "cloudflare",
+    name:
+      (options.useConfiguredName ? cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_PROVIDER_NAME) : undefined) ??
+      "Cloudflare Speed Test",
+    downloadUrl: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_DOWNLOAD_URL) ?? DEFAULT_REMOTE_DOWNLOAD_URL,
+    uploadUrl: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_UPLOAD_URL) ?? DEFAULT_REMOTE_UPLOAD_URL,
+    metadataUrl: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_METADATA_URL) ?? DEFAULT_REMOTE_METADATA_URL,
+    targetDiscoveryUrl: null,
   };
 }
 

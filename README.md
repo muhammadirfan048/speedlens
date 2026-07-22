@@ -2,7 +2,7 @@
 
 A minimal, dark-first internet speed test built with Next.js App Router, React, TypeScript, TailwindCSS, Framer Motion, and Lucide Icons.
 
-SpeedLens measures against Fast.com/Netflix speed-test targets by default so results line up with Fast.com more closely and local development does not accidentally benchmark `localhost`/loopback speed.
+SpeedLens measures against Fast.com/Netflix speed-test targets by default so results line up with Fast.com more closely and local development does not accidentally benchmark `localhost`/loopback speed. If those targets are not usable in a deployed environment, the app automatically retries against Cloudflare's public speed-test endpoints.
 
 ## Run
 
@@ -12,6 +12,8 @@ npm run dev
 ```
 
 The test starts automatically on page load. The speed engine lives in `services/SpeedTestService.ts` and can be pointed at Cloudflare or local app-server endpoints with optional environment variables.
+
+On hosts such as Vercel, Fast.com target discovery runs from the deployed server route. If Netflix returns target URLs that the browser cannot use, SpeedLens falls back to Cloudflare instead of leaving the test stuck at latency analysis.
 
 ## Optional Environment
 

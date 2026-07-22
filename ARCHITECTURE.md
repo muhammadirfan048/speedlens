@@ -86,6 +86,8 @@ The backend is implemented with Next.js App Router route handlers under `app/api
 
 `/api/speed-test/fast-targets` is used by the default Fast.com provider to fetch Netflix target URLs server-side and return them to the browser as same-origin JSON.
 
+On deployed hosts, that server-side discovery can return Netflix URLs selected for the hosting platform rather than the end user's browser connection. If those Fast.com/Netflix targets fail during discovery, latency, download, or upload, `SpeedTestService` switches to Cloudflare's public speed-test endpoints and reruns the test.
+
 The other endpoints are same-origin APIs used only when the app is configured for local provider mode with `NEXT_PUBLIC_SPEED_TEST_PROVIDER=local`.
 
 They are useful for app-server development checks, but they should not be used for real internet speed results because local development can measure loopback traffic.
@@ -113,6 +115,8 @@ There is no separate backend server, database, queue, scheduled worker, or persi
 6. Calculate jitter from latency samples.
 7. Collect browser/network diagnostics.
 8. Emit progress snapshots and final results to React subscribers.
+
+If a Fast.com/Netflix request fails, the service resets provider metadata, swaps to Cloudflare, and reruns the same lifecycle against Cloudflare endpoints.
 
 The service uses `AbortController` so retries and component unmounts can stop in-flight work. Results are kept only in memory inside the service instance.
 
@@ -160,7 +164,7 @@ The `lib/future` directory contains typed status placeholders for planned featur
 
 ## External Services
 
-Fast.com/Netflix speed-test targets are used by default. Cloudflare's public speed-test endpoints are available as an optional provider mode.
+Fast.com/Netflix speed-test targets are used by default. Cloudflare's public speed-test endpoints are available as an optional provider mode and as the automatic fallback when Fast.com/Netflix targets are not usable.
 
 Current service usage:
 
@@ -173,7 +177,7 @@ Current service usage:
 | Object/file storage | None. |
 | Analytics/monitoring | None. |
 | AI provider | None. The UI labels AI diagnosis as disabled. |
-| Speed-test provider | Fast.com/Netflix by default. Cloudflare and local Next.js endpoints are optional modes. |
+| Speed-test provider | Fast.com/Netflix by default. Cloudflare is the automatic fallback and can also be selected directly. Local Next.js endpoints are optional development mode. |
 
 The default provider can be changed with `NEXT_PUBLIC_SPEED_TEST_PROVIDER`.
 
