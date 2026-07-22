@@ -18,6 +18,8 @@ export default function AdvancedPanel({ results }: { results: SpeedTestResults |
     ["Jitter", formatMs(diagnostics?.jitterMs ?? null)],
     ["Packet Loss", formatPercent(diagnostics?.packetLossPercent ?? null)],
     ["Connection Type", diagnostics?.connectionType ?? null],
+    ["Client Location", diagnostics?.clientLocation ?? null],
+    ["Network Provider", diagnostics?.networkProvider ?? null],
     ["Browser", diagnostics?.browser ?? null],
     ["OS", diagnostics?.os ?? null],
     ["Screen Resolution", diagnostics?.screenResolution ?? null],

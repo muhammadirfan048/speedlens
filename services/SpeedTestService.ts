@@ -19,10 +19,57 @@ type UploadResponse = {
   serverTime: number;
 };
 
+type SpeedTestProvider = {
+  kind: "fast" | "cloudflare" | "local";
+  name: string;
+  downloadUrl: string;
+  uploadUrl: string;
+  metadataUrl: string | null;
+  targetDiscoveryUrl: string | null;
+};
+
+type SpeedTestProviderMetadata = {
+  clientIp?: string;
+  ip?: string;
+  colo?: string;
+  coloCity?: string;
+  coloRegion?: string;
+  city?: string;
+  region?: string;
+  country?: string;
+  asOrganization?: string;
+};
+
 type TransferSample = {
   bytes: number;
   seconds: number;
 };
+
+type FastTarget = {
+  name?: string;
+  url: string;
+  location?: {
+    city?: string;
+    country?: string;
+  };
+};
+
+type FastTargetsResponse = {
+  client?: {
+    ip?: string;
+    asn?: string;
+    location?: {
+      city?: string;
+      country?: string;
+    };
+  };
+  targets?: FastTarget[];
+};
+
+const FAST_TARGETS_URL = "/api/speed-test/fast-targets";
+const DEFAULT_REMOTE_DOWNLOAD_URL = "https://speed.cloudflare.com/__down";
+const DEFAULT_REMOTE_UPLOAD_URL = "https://speed.cloudflare.com/__up";
+const DEFAULT_REMOTE_METADATA_URL = "https://speed.cloudflare.com/meta";
 
 const DOWNLOAD_START_PROGRESS = 38;
 const DOWNLOAD_END_PROGRESS = 70;
@@ -42,6 +89,10 @@ export class SpeedTestService {
   private listeners = new Set<Listener>();
   private abortController: AbortController | null = null;
   private latestResults: SpeedTestResults | null = null;
+  private measurementId = createMeasurementId();
+  private providerMetadata: SpeedTestProviderMetadata | null = null;
+  private readonly provider = getSpeedTestProvider();
+  private fastTargets: FastTarget[] = [];
   private stopped = false;
 
   subscribe(listener: Listener): () => void {
@@ -52,18 +103,22 @@ export class SpeedTestService {
   async start(): Promise<void> {
     this.stop();
     this.abortController = new AbortController();
+    this.measurementId = createMeasurementId();
+    this.providerMetadata = null;
+    this.fastTargets = [];
     this.stopped = false;
 
     try {
       this.emitSnapshot("connecting", "Connecting...", 4, 0);
       await this.wait(280);
 
-      const serverInfo = await this.findServer();
+      let serverInfo = await this.findServer();
 
       this.emitSnapshot("latency", "Analyzing latency...", 20, 0);
       const latencySamples = await this.measureLatency(5);
       const pingMs = average(latencySamples);
       const jitterMs = calculateJitter(latencySamples);
+      serverInfo = this.getCurrentServerInfo(serverInfo);
 
       this.emitSnapshot("download", "Testing download...", DOWNLOAD_START_PROGRESS, 0);
       const downloadMbps = await this.measureDownload((value, progress) => {
@@ -72,12 +127,13 @@ export class SpeedTestService {
 
       this.emitSnapshot("upload", "Testing upload...", UPLOAD_START_PROGRESS, downloadMbps);
       const uploadMbps = await this.measureUpload(downloadMbps);
+      serverInfo = this.getCurrentServerInfo(serverInfo);
 
       this.emitSnapshot("jitter", "Measuring jitter...", 84, downloadMbps);
       await this.wait(320);
 
-      this.emitSnapshot("packetLoss", "Checking packet loss...", 92, downloadMbps);
-      const packetLossPercent = this.estimatePacketLoss(latencySamples);
+      this.emitSnapshot("packetLoss", "Finalizing diagnostics...", 92, downloadMbps);
+      const packetLossPercent = null;
       await this.wait(260);
 
       const diagnostics = this.collectDiagnostics({
@@ -125,6 +181,19 @@ export class SpeedTestService {
 
   private async findServer(): Promise<ServerInfo> {
     this.emitSnapshot("server", "Finding nearest server...", 12, 0);
+
+    if (this.provider.kind === "fast") {
+      const targets = await this.fetchFastTargets();
+      await this.wait(120);
+      return fastTargetsToServerInfo(this.provider, targets);
+    }
+
+    if (this.provider.kind === "cloudflare") {
+      const metadata = await this.fetchProviderMetadata();
+      await this.wait(120);
+      return metadataToServerInfo(this.provider, metadata);
+    }
+
     const start = performance.now();
     const response = await fetch(`/api/speed-test/ping?t=${Date.now()}`, {
       cache: "no-store",
@@ -141,13 +210,76 @@ export class SpeedTestService {
     return body.server;
   }
 
+  private async fetchFastTargets(): Promise<FastTarget[]> {
+    if (!this.provider.targetDiscoveryUrl) {
+      throw new Error("Fast.com target discovery is not configured");
+    }
+
+    const response = await fetch(withQuery(this.provider.targetDiscoveryUrl, { t: Date.now() }), {
+      cache: "no-store",
+      signal: this.abortController?.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error("Fast.com target discovery failed");
+    }
+
+    const body = (await response.json()) as FastTargetsResponse;
+    const targets = Array.isArray(body.targets)
+      ? body.targets.filter((target) => typeof target.url === "string" && target.url.startsWith("https://"))
+      : [];
+
+    if (targets.length === 0) {
+      throw new Error("Fast.com did not return usable targets");
+    }
+
+    this.fastTargets = targets;
+    this.providerMetadata = normalizeProviderMetadata({
+      clientIp: body.client?.ip,
+      ip: body.client?.ip,
+      city: body.client?.location?.city,
+      country: body.client?.location?.country,
+      asOrganization: body.client?.asn ? `ASN ${body.client.asn}` : undefined,
+    });
+
+    return targets;
+  }
+
+  private async fetchProviderMetadata(): Promise<SpeedTestProviderMetadata | null> {
+    if (!this.provider.metadataUrl) {
+      return null;
+    }
+
+    try {
+      const response = await fetch(withQuery(this.provider.metadataUrl, { t: Date.now() }), {
+        cache: "no-store",
+        signal: this.abortController?.signal,
+      });
+
+      if (!response.ok) {
+        return null;
+      }
+
+      const metadata = normalizeProviderMetadata(await response.json());
+      this.providerMetadata = metadata;
+      return metadata;
+    } catch (error) {
+      if (this.stopped) {
+        throw error;
+      }
+
+      return null;
+    }
+  }
+
   private async measureLatency(samples: number): Promise<number[]> {
     const values: number[] = [];
 
     for (let index = 0; index < samples; index += 1) {
       const startedAt = performance.now();
-      const response = await fetch(`/api/speed-test/ping?sample=${index}&t=${Date.now()}`, {
+      const response = await fetch(this.createLatencyUrl(index), {
         cache: "no-store",
+        headers: this.createDownloadHeaders(1),
         signal: this.abortController?.signal,
       });
 
@@ -155,7 +287,8 @@ export class SpeedTestService {
         throw new Error("Latency test failed");
       }
 
-      await response.json();
+      this.captureProviderMetadata(response.headers);
+      await readResponseBytes(response);
       values.push(performance.now() - startedAt);
       this.emitSnapshot("latency", "Analyzing latency...", 20 + index * 3, 0);
       await this.wait(80);
@@ -226,8 +359,10 @@ export class SpeedTestService {
   }
 
   private async measureDownloadSample(bytes: number, index: number): Promise<TransferSample> {
-    const response = await fetch(`/api/speed-test/payload?bytes=${bytes}&sample=${index}&t=${Date.now()}`, {
+    const startedAt = performance.now();
+    const response = await fetch(this.createDownloadUrl(bytes, index), {
       cache: "no-store",
+      headers: this.createDownloadHeaders(bytes),
       signal: this.abortController?.signal,
     });
 
@@ -235,7 +370,7 @@ export class SpeedTestService {
       throw new Error("Download test failed");
     }
 
-    const startedAt = performance.now();
+    this.captureProviderMetadata(response.headers);
     const receivedBytes = await readResponseBytes(response);
     const seconds = Math.max((performance.now() - startedAt) / 1000, 0.001);
 
@@ -248,13 +383,10 @@ export class SpeedTestService {
   private async measureUploadSample(bytes: number): Promise<TransferSample> {
     const body = createUploadPayload(bytes);
     const startedAt = performance.now();
-    const response = await fetch(`/api/speed-test/upload?t=${Date.now()}`, {
+    const response = await fetch(this.createUploadUrl(bytes), {
       method: "POST",
       body,
       cache: "no-store",
-      headers: {
-        "Content-Type": "application/octet-stream",
-      },
       signal: this.abortController?.signal,
     });
 
@@ -262,39 +394,45 @@ export class SpeedTestService {
       throw new Error("Upload test failed");
     }
 
-    const result = (await response.json()) as UploadResponse;
+    this.captureProviderMetadata(response.headers);
+    const confirmedBytes = this.provider.kind === "local"
+      ? Math.min(((await response.json()) as UploadResponse).receivedBytes, bytes)
+      : bytes;
+
+    if (this.provider.kind !== "local") {
+      await readResponseBytes(response);
+    }
+
     const seconds = Math.max((performance.now() - startedAt) / 1000, 0.001);
 
     return {
-      bytes: Math.min(result.receivedBytes, bytes),
+      bytes: confirmedBytes,
       seconds,
     };
-  }
-
-  private estimatePacketLoss(samples: number[]): number {
-    const unstableSamples = samples.filter((value) => value > average(samples) * 2).length;
-    return round(Math.min(unstableSamples * 0.2, 2.4), 1);
   }
 
   private collectDiagnostics(metrics: {
     pingMs: number;
     jitterMs: number;
-    packetLossPercent: number;
+    packetLossPercent: number | null;
   }): NetworkDiagnostics {
     const hints = getNavigatorHints();
     const userAgent = hints?.userAgent ?? "Unavailable";
     const connection = hints?.connection;
     const connectionType = normalizeConnectionType(connection?.type);
+    const clientIp = this.providerMetadata?.clientIp ?? this.providerMetadata?.ip ?? null;
 
     return {
-      ipv4: "Detect via edge endpoint",
-      ipv6: "Detect via edge endpoint",
-      dnsLookupMs: Math.max(1, Math.round(metrics.pingMs * 0.18)),
+      ipv4: clientIp && isIpv4(clientIp) ? clientIp : null,
+      ipv6: clientIp && isIpv6(clientIp) ? clientIp : null,
+      dnsLookupMs: null,
       unloadedLatencyMs: round(metrics.pingMs, 1),
-      loadedLatencyMs: round(metrics.pingMs + metrics.jitterMs * 2.2 + 8, 1),
+      loadedLatencyMs: null,
       jitterMs: round(metrics.jitterMs, 1),
       packetLossPercent: metrics.packetLossPercent,
       connectionType,
+      clientLocation: joinParts([this.providerMetadata?.city, this.providerMetadata?.region, this.providerMetadata?.country]),
+      networkProvider: this.providerMetadata?.asOrganization ?? null,
       browser: detectBrowser(userAgent),
       os: detectOs(userAgent, hints?.userAgentData?.platform),
       screenResolution:
@@ -309,6 +447,101 @@ export class SpeedTestService {
       language: hints?.language ?? "Unavailable",
       userAgent,
     };
+  }
+
+  private captureProviderMetadata(headers: Headers): void {
+    if (this.provider.kind !== "cloudflare") {
+      return;
+    }
+
+    const metadata = metadataFromHeaders(headers);
+
+    if (!metadata) {
+      return;
+    }
+
+    this.providerMetadata = {
+      ...this.providerMetadata,
+      ...metadata,
+    };
+  }
+
+  private getCurrentServerInfo(fallback: ServerInfo): ServerInfo {
+    if (this.provider.kind !== "cloudflare" || !this.providerMetadata) {
+      return fallback;
+    }
+
+    return metadataToServerInfo(this.provider, this.providerMetadata);
+  }
+
+  private createLatencyUrl(sample: number): string {
+    if (this.provider.kind === "local") {
+      return withQuery("/api/speed-test/ping", {
+        sample,
+        t: Date.now(),
+      });
+    }
+
+    return this.createDownloadUrl(1, sample);
+  }
+
+  private createDownloadUrl(bytes: number, sample: number): string {
+    if (this.provider.kind === "local") {
+      return withQuery("/api/speed-test/payload", {
+        bytes,
+        sample,
+        t: Date.now(),
+      });
+    }
+
+    if (this.provider.kind === "fast") {
+      return this.getFastTarget(sample).url;
+    }
+
+    return withQuery(this.provider.downloadUrl, {
+      bytes,
+      measId: this.measurementId,
+      sample,
+      t: Date.now(),
+    });
+  }
+
+  private createUploadUrl(bytes: number): string {
+    if (this.provider.kind === "local") {
+      return withQuery("/api/speed-test/upload", {
+        t: Date.now(),
+      });
+    }
+
+    if (this.provider.kind === "fast") {
+      return this.getFastTarget(0).url;
+    }
+
+    return withQuery(this.provider.uploadUrl, {
+      bytes,
+      measId: this.measurementId,
+      t: Date.now(),
+    });
+  }
+
+  private createDownloadHeaders(bytes: number): HeadersInit | undefined {
+    if (this.provider.kind !== "fast") {
+      return undefined;
+    }
+
+    return {
+      Range: `bytes=0-${Math.max(bytes - 1, 0)}`,
+    };
+  }
+
+  private getFastTarget(index: number): FastTarget {
+    const target = this.fastTargets[index % this.fastTargets.length];
+
+    if (!target) {
+      throw new Error("Fast.com target is unavailable");
+    }
+
+    return target;
   }
 
   private emitSnapshot(
@@ -353,6 +586,179 @@ function normalizeConnectionType(type?: string): "wifi" | "cellular" | "ethernet
   }
 
   return "unknown";
+}
+
+function getSpeedTestProvider(): SpeedTestProvider {
+  const providerMode = cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_PROVIDER)?.toLowerCase();
+
+  if (providerMode === "local") {
+    return {
+      kind: "local",
+      name: "SpeedLens Local",
+      downloadUrl: "/api/speed-test/payload",
+      uploadUrl: "/api/speed-test/upload",
+      metadataUrl: null,
+      targetDiscoveryUrl: null,
+    };
+  }
+
+  if (providerMode === "cloudflare") {
+    return {
+      kind: "cloudflare",
+      name: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_PROVIDER_NAME) ?? "Cloudflare Speed Test",
+      downloadUrl: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_DOWNLOAD_URL) ?? DEFAULT_REMOTE_DOWNLOAD_URL,
+      uploadUrl: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_UPLOAD_URL) ?? DEFAULT_REMOTE_UPLOAD_URL,
+      metadataUrl: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_METADATA_URL) ?? DEFAULT_REMOTE_METADATA_URL,
+      targetDiscoveryUrl: null,
+    };
+  }
+
+  return {
+    kind: "fast",
+    name: cleanEnv(process.env.NEXT_PUBLIC_SPEED_TEST_PROVIDER_NAME) ?? "Fast.com / Netflix",
+    downloadUrl: "",
+    uploadUrl: "",
+    metadataUrl: null,
+    targetDiscoveryUrl: cleanEnv(process.env.NEXT_PUBLIC_FAST_TARGETS_URL) ?? FAST_TARGETS_URL,
+  };
+}
+
+function cleanEnv(value: string | undefined): string | undefined {
+  return value && value.trim() !== "" ? value : undefined;
+}
+
+function metadataToServerInfo(
+  provider: SpeedTestProvider,
+  metadata: SpeedTestProviderMetadata | null,
+): ServerInfo {
+  if (!metadata) {
+    return {
+      name: provider.name,
+      location: "Nearest remote edge",
+      region: "Auto",
+    };
+  }
+
+  const location = joinParts([metadata.city, metadata.region, metadata.country]) ?? "Nearest remote edge";
+  const region = joinParts([metadata.colo, metadata.coloCity, metadata.coloRegion]) ?? "Auto";
+
+  return {
+    name: provider.name,
+    location,
+    region,
+  };
+}
+
+function fastTargetsToServerInfo(provider: SpeedTestProvider, targets: FastTarget[]): ServerInfo {
+  const locations = targets
+    .map((target) => joinParts([target.location?.city, target.location?.country]))
+    .filter((location): location is string => location !== null);
+  const uniqueLocations = Array.from(new Set(locations));
+
+  return {
+    name: provider.name,
+    location: uniqueLocations.slice(0, 3).join(" | ") || "Netflix Open Connect",
+    region: "Fast.com",
+  };
+}
+
+function metadataFromHeaders(headers: Headers): SpeedTestProviderMetadata | null {
+  return normalizeProviderMetadata({
+    clientIp: readHeader(headers, "cf-meta-ip", "client-ip", "ip"),
+    colo: readHeader(headers, "cf-meta-colo", "colo"),
+    city: readHeader(headers, "cf-meta-city", "city"),
+    region: readHeader(headers, "cf-meta-region", "region"),
+    country: readHeader(headers, "cf-meta-country", "country"),
+    asOrganization: readHeader(headers, "cf-meta-as-organization", "as-organization"),
+  });
+}
+
+function readHeader(headers: Headers, ...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = headers.get(name);
+
+    if (value && value.trim() !== "") {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeProviderMetadata(raw: unknown): SpeedTestProviderMetadata | null {
+  const record = asRecord(raw);
+
+  if (!record) {
+    return null;
+  }
+
+  const colo = readRecordValue(record, "colo");
+  const coloRecord = asRecord(colo);
+  const metadata: SpeedTestProviderMetadata = {
+    clientIp: readRecordString(record, "clientIp") ?? readRecordString(record, "ip"),
+    ip: readRecordString(record, "ip"),
+    colo: typeof colo === "string" ? cleanEnv(colo) : readRecordString(coloRecord, "iata"),
+    coloCity: readRecordString(coloRecord, "city"),
+    coloRegion: readRecordString(coloRecord, "region"),
+    city: readRecordString(record, "city"),
+    region: readRecordString(record, "region"),
+    country: readRecordString(record, "country"),
+    asOrganization: readRecordString(record, "asOrganization"),
+  };
+
+  return Object.values(metadata).some(Boolean) ? metadata : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function readRecordValue(record: Record<string, unknown> | null, key: string): unknown {
+  return record ? record[key] : undefined;
+}
+
+function readRecordString(record: Record<string, unknown> | null, key: string): string | undefined {
+  const value = readRecordValue(record, key);
+
+  if (typeof value === "string") {
+    return cleanEnv(value);
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return undefined;
+}
+
+function withQuery(input: string, params: Record<string, string | number>): string {
+  const baseUrl = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+  const url = new URL(input, baseUrl);
+
+  Object.entries(params).forEach(([key, value]) => {
+    url.searchParams.set(key, String(value));
+  });
+
+  return url.toString();
+}
+
+function createMeasurementId(): number {
+  return Date.now() + Math.floor(Math.random() * 1_000_000);
+}
+
+function joinParts(parts: Array<string | undefined>): string | null {
+  const value = parts.filter((part): part is string => Boolean(cleanEnv(part))).join(", ");
+  return value === "" ? null : value;
+}
+
+function isIpv4(value: string): boolean {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(value);
+}
+
+function isIpv6(value: string): boolean {
+  return value.includes(":");
 }
 
 function average(values: number[]): number {

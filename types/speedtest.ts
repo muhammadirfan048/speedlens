@@ -24,7 +24,7 @@ export type SpeedTestResults = {
   uploadMbps: number;
   pingMs: number;
   jitterMs: number;
-  packetLossPercent: number;
+  packetLossPercent: number | null;
   server: ServerInfo;
   diagnostics: NetworkDiagnostics;
   completedAt: string;
@@ -45,6 +45,8 @@ export type NetworkDiagnostics = {
   jitterMs: number | null;
   packetLossPercent: number | null;
   connectionType: ConnectionType;
+  clientLocation: string | null;
+  networkProvider: string | null;
   browser: string;
   os: string;
   screenResolution: string;
